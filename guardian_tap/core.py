@@ -10,7 +10,7 @@ import re
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from starlette.types import ASGIApp, Receive, Scope, Send, Message
 
-from . import __version__
+_VERSION = "0.1.0"
 
 logger = logging.getLogger("guardian_tap")
 
@@ -182,7 +182,7 @@ def attach_observer(
         return {
             "status": "ok",
             "guardian_tap": True,
-            "version": __version__,
+            "version": _VERSION,
             "framework": "fastapi",
             "observers": len(_observers),
             "websocket_support": ws_available,
