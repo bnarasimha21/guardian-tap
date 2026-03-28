@@ -1,0 +1,15 @@
+[project]
+name = "guardian-tap"
+version = "0.1.0"
+description = "One-line integration to make any FastAPI WebSocket app observable by GuardianAI"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "Narasimha Badrinath"}]
+dependencies = [
+    "fastapi>=0.100.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
