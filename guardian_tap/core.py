@@ -10,6 +10,8 @@ import re
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from starlette.types import ASGIApp, Receive, Scope, Send, Message
 
+from . import __version__
+
 logger = logging.getLogger("guardian_tap")
 
 _observers: set[WebSocket] = set()
@@ -169,7 +171,24 @@ def attach_observer(
         attach_observer(app)
     """
 
-    # 1. Add the observer endpoint
+    # 1a. Add HTTP health check at the same path
+    @app.get(path)
+    async def _guardian_health():
+        ws_available = True
+        try:
+            import websockets  # noqa: F401
+        except ImportError:
+            ws_available = False
+        return {
+            "status": "ok",
+            "guardian_tap": True,
+            "version": __version__,
+            "framework": "fastapi",
+            "observers": len(_observers),
+            "websocket_support": ws_available,
+        }
+
+    # 1b. Add the observer WebSocket endpoint
     @app.websocket(path)
     async def _guardian_observe(websocket: WebSocket) -> None:
         await websocket.accept()
