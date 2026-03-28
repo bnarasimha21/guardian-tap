@@ -1,11 +1,11 @@
 """Core module: attaches an observer WebSocket endpoint to any FastAPI app
-and intercepts outgoing messages (WebSocket and SSE) by wrapping the middleware stack."""
+and intercepts outgoing messages (WebSocket, SSE, JSON) by wrapping the middleware stack."""
 
 from __future__ import annotations
 
 import json
 import logging
-import re
+import time
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from starlette.types import ASGIApp, Receive, Scope, Send, Message
@@ -15,9 +15,6 @@ _VERSION = "0.1.0"
 logger = logging.getLogger("guardian_tap")
 
 _observers: set[WebSocket] = set()
-
-# Regex to parse SSE "data:" lines
-_SSE_DATA_RE = re.compile(r"^data:\s*(.+)$", re.MULTILINE)
 
 
 async def _broadcast(text: str) -> None:
@@ -33,6 +30,19 @@ async def _broadcast(text: str) -> None:
     _observers.difference_update(dead)
 
 
+async def _broadcast_with_context(data: dict, path: str = "", method: str = "") -> None:
+    """Broadcast a dict wrapped in a tap envelope with request context."""
+    envelope = {
+        "_tap": {
+            "path": path,
+            "method": method,
+            "timestamp": time.time(),
+        },
+        **data,
+    }
+    await _broadcast(json.dumps(envelope))
+
+
 def _try_parse_json(text: str) -> dict | None:
     """Try to parse a string as JSON dict. Returns None on failure."""
     try:
@@ -43,15 +53,7 @@ def _try_parse_json(text: str) -> dict | None:
 
 
 def _extract_sse_events(body: str) -> list[dict]:
-    """Extract JSON payloads from SSE body chunks.
-
-    SSE format:
-        event: some_event
-        data: {"key": "value"}
-
-    We extract the data lines and parse them as JSON.
-    We also capture the event type from preceding "event:" lines.
-    """
+    """Extract JSON payloads from SSE body chunks."""
     events = []
     current_event_type = None
 
@@ -63,29 +65,20 @@ def _extract_sse_events(body: str) -> list[dict]:
             data_str = line[5:].strip()
             parsed = _try_parse_json(data_str)
             if parsed is not None:
-                # Wrap in a standard envelope if it doesn't have "type"
                 if "type" not in parsed and current_event_type:
-                    events.append({
-                        "type": current_event_type,
-                        "data": parsed,
-                    })
+                    events.append({"type": current_event_type, "data": parsed})
                 else:
                     events.append(parsed)
                 current_event_type = None
             elif current_event_type and data_str:
-                # Non-JSON data line
-                events.append({
-                    "type": current_event_type,
-                    "data": {"raw": data_str},
-                })
+                events.append({"type": current_event_type, "data": {"raw": data_str}})
                 current_event_type = None
 
     return events
 
 
 class _TapMiddleware:
-    """ASGI wrapper that intercepts WebSocket sends and SSE responses,
-    broadcasting them to connected observers."""
+    """ASGI wrapper that intercepts WebSocket sends, SSE streams, and JSON responses."""
 
     def __init__(self, app: ASGIApp, observe_path: str) -> None:
         self.app = app
@@ -100,23 +93,37 @@ class _TapMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # WebSocket interception
+        # WebSocket interception (text + binary)
         if scope_type == "websocket":
             async def ws_send_wrapper(message: Message) -> None:
                 await send(message)
-                if (
-                    message.get("type") == "websocket.send"
-                    and "text" in message
-                    and _observers
-                ):
-                    await _broadcast(message["text"])
+                if not _observers or message.get("type") != "websocket.send":
+                    return
+
+                raw = None
+                if "text" in message:
+                    raw = message["text"]
+                elif "bytes" in message and message["bytes"]:
+                    try:
+                        raw = message["bytes"].decode("utf-8", errors="ignore")
+                    except Exception:
+                        pass
+
+                if raw:
+                    parsed = _try_parse_json(raw)
+                    if parsed is not None:
+                        await _broadcast_with_context(parsed, path=path, method="WS")
+                    else:
+                        await _broadcast(raw)
 
             await self.app(scope, receive, ws_send_wrapper)
             return
 
-        # HTTP interception (SSE streams + JSON responses)
+        # HTTP interception (SSE + JSON + chunked)
         if scope_type == "http" and _observers:
             content_type = ""
+            method = scope.get("method", "")
+            body_chunks: list[str] = []
 
             async def http_send_wrapper(message: Message) -> None:
                 nonlocal content_type
@@ -132,24 +139,30 @@ class _TapMiddleware:
                     content_type = headers.get("content-type", "")
 
                 # Intercept response body
-                if (
-                    message.get("type") == "http.response.body"
-                    and message.get("body")
-                ):
-                    body = message["body"]
-                    if isinstance(body, bytes):
-                        body = body.decode("utf-8", errors="ignore")
+                if message.get("type") != "http.response.body" or not message.get("body"):
+                    return
 
-                    if "text/event-stream" in content_type:
-                        # SSE: parse event/data lines
-                        events = _extract_sse_events(body)
-                        for event in events:
-                            await _broadcast(json.dumps(event))
-                    elif "application/json" in content_type:
-                        # JSON API response: broadcast if it's a dict
-                        parsed = _try_parse_json(body)
+                chunk = message["body"]
+                if isinstance(chunk, bytes):
+                    chunk = chunk.decode("utf-8", errors="ignore")
+
+                more_body = message.get("more_body", False)
+
+                if "text/event-stream" in content_type:
+                    # SSE: parse each chunk immediately
+                    events = _extract_sse_events(chunk)
+                    for event in events:
+                        await _broadcast_with_context(event, path=path, method=method)
+
+                elif "application/json" in content_type:
+                    # JSON: may arrive in multiple chunks
+                    body_chunks.append(chunk)
+                    if not more_body:
+                        full_body = "".join(body_chunks)
+                        parsed = _try_parse_json(full_body)
                         if parsed is not None:
-                            await _broadcast(json.dumps(parsed))
+                            await _broadcast_with_context(parsed, path=path, method=method)
+                        body_chunks.clear()
 
             await self.app(scope, receive, http_send_wrapper)
             return
@@ -164,8 +177,9 @@ def attach_observer(
 ) -> None:
     """Attach a GuardianAI observer endpoint to a FastAPI app.
 
-    Supports both WebSocket and SSE (Server-Sent Events) apps.
-    All outgoing messages are broadcast to connected observers.
+    Intercepts WebSocket (text + binary), SSE, and JSON API responses.
+    All outgoing messages are broadcast to connected observers with
+    request context (path, method, timestamp).
 
     Args:
         app: The FastAPI application instance.
@@ -176,7 +190,7 @@ def attach_observer(
         attach_observer(app)
     """
 
-    # 1a. Add HTTP health check at the same path
+    # Health check endpoint (HTTP GET)
     @app.get(path)
     async def _guardian_health():
         ws_available = True
@@ -193,7 +207,7 @@ def attach_observer(
             "websocket_support": ws_available,
         }
 
-    # 1b. Add the observer WebSocket endpoint
+    # Observer WebSocket endpoint
     @app.websocket(path)
     async def _guardian_observe(websocket: WebSocket) -> None:
         await websocket.accept()
@@ -206,13 +220,13 @@ def attach_observer(
             _observers.discard(websocket)
             logger.info("Guardian observer disconnected (%d remaining)", len(_observers))
 
-    # 2. Wrap the middleware stack at startup
+    # Install middleware at startup
     @app.on_event("startup")
     async def _install_tap() -> None:
         if app.middleware_stack is None:
             app.middleware_stack = app.build_middleware_stack()
         app.middleware_stack = _TapMiddleware(app.middleware_stack, observe_path=path)
-        logger.info("guardian-tap: middleware installed at %s (ws + sse)", path)
+        logger.info("guardian-tap: middleware installed at %s", path)
 
     logger.info("guardian-tap attached at %s", path)
 
